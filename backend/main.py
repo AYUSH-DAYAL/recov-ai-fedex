@@ -1,15 +1,31 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile
+"""
+RECOV.AI - FastAPI Backend
+===========================
+Main API server for debt recovery predictions. 
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from backend.models import AccountData, PredictionResponse
-from backend.predictor import RecoveryPredictor
+from pydantic import BaseModel
+from typing import Optional, List
 import pandas as pd
 import io
+import uvicorn
 
-# ==========================================
-# SETUP & CONFIGURATION
-# ==========================================
-app = FastAPI(title="Recov.AI FedEx Backend", version="1.0")
+# Import predictor
+try:
+    from backend.predictor import RecoveryPredictor
+except: 
+    from predictor import RecoveryPredictor
 
+# Initialize FastAPI app
+app = FastAPI(
+    title="RECOV.AI API",
+    description="AI-powered debt recovery prediction system",
+    version="1.0.0"
+)
+
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,55 +34,181 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-predictor = RecoveryPredictor()
-accounts_db = {} # In-memory storage
+# Initialize AI Engine
+try:
+    predictor = RecoveryPredictor()
+    print("✅ AI Engine Loaded Successfully")
+except Exception as e: 
+    print(f"❌ AI Engine Failed to Load: {e}")
+    predictor = None
+
+# In-memory storage for accounts
+accounts_db = {}
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
+class AccountRequest(BaseModel):
+    """Single account prediction request"""
+    account_id: str
+    company_name: str
+    amount: float
+    days_overdue: int
+    payment_history_score: float
+    shipment_volume_change_30d: float
+    
+    # Optional fields with defaults
+    shipment_volume_30d: Optional[int] = 0
+    express_ratio: Optional[float] = 0.0
+    destination_diversity: Optional[int] = 0
+    industry: Optional[str] = "Other"
+    region: Optional[str] = "Other"
+    email_opened: Optional[bool] = False
+    dispute_flag: Optional[bool] = False
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
 @app.get("/")
 def home():
-    return {"status": "Backend is Running", "accounts_analyzed": len(accounts_db)}
+    """Health check endpoint"""
+    return {
+        "status": "RECOV.AI Backend Running",
+        "project": "FedEx SMART Hackathon 2026",
+        "endpoints": {
+            "health": "GET /",
+            "single_prediction": "POST /predict",
+            "batch_analysis": "POST /analyze",
+            "get_account": "GET /account/{account_id}"
+        },
+        "ai_engine": "Loaded" if predictor else "Error"
+    }
 
-# 1. SINGLE PREDICTION
-@app.post("/predict", response_model=PredictionResponse)
-def predict_single(account: AccountData):
+@app.post("/predict")
+def predict_single(data: AccountRequest):
+    """
+    Predict recovery for a single account. 
+    
+    **Day 3 Requirement:** Single account prediction endpoint
+    """
+    if not predictor:
+        raise HTTPException(status_code=500, detail="AI Engine not loaded")
+    
     try:
-        data = account.dict()
-        result = predictor.predict_recovery(data)
-        acc_id = data.get("account_id", "SINGLE_SCAN")
-        accounts_db[acc_id] = result
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# 2. BATCH CSV UPLOAD
-@app.post("/analyze")
-async def analyze_batch(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        results = []
+        # Convert to dict
+        account_data = data.dict()
         
-        for _, row in df.iterrows():
-            account_data = row.to_dict()
-            try:
-                # Ensure minimal required fields exist
-                if 'amount' not in account_data: account_data['amount'] = 0
-                
-                prediction = predictor.predict_recovery(account_data)
-                
-                acc_id = str(account_data.get('account_id', f"ROW_{_}"))
-                accounts_db[acc_id] = prediction
-                results.append(prediction)
-            except Exception as e:
-                print(f"Skipping row {_}: {e}")
-                continue
-                
-        return {"status": "success", "results": results}
+        # Store in memory
+        accounts_db[account_data['account_id']] = account_data
+        
+        # Get prediction
+        result = predictor.predict_recovery(account_data)
+        
+        return result
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-# 3. GET DETAILS
+@app.post("/analyze")
+async def analyze_csv(file: UploadFile = File(...)):
+    """
+    Analyze multiple accounts from CSV file.
+    
+    **Day 3 Requirement:** CSV upload and batch processing
+    
+    Expected CSV columns:
+    - account_id, company_name, amount, days_overdue
+    - payment_history_score, shipment_volume_change_30d
+    - Optional: industry, region, email_opened, dispute_flag
+    """
+    if not predictor:
+        raise HTTPException(status_code=500, detail="AI Engine not loaded")
+    
+    try:
+        # Read CSV file
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+        
+        # Validate required columns
+        required_cols = ['account_id', 'company_name', 'amount', 'days_overdue', 
+                         'payment_history_score', 'shipment_volume_change_30d']
+        
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Missing required columns: {missing_cols}"
+            )
+        
+        # Process each account
+        predictions = []
+        for idx, row in df.iterrows():
+            account_dict = row.to_dict()
+            
+            # Store in memory
+            accounts_db[account_dict['account_id']] = account_dict
+            
+            # Get prediction
+            result = predictor.predict_recovery(account_dict)
+            predictions.append(result)
+        
+        return {
+            "total_accounts": len(predictions),
+            "predictions": predictions,
+            "summary": {
+                "high_probability": sum(1 for p in predictions if p['recovery_probability'] > 0.7),
+                "medium_probability": sum(1 for p in predictions if 0.4 < p['recovery_probability'] <= 0.7),
+                "low_probability": sum(1 for p in predictions if p['recovery_probability'] <= 0.4),
+            }
+        }
+        
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
 @app.get("/account/{account_id}")
 def get_account(account_id: str):
-    if account_id in accounts_db:
-        return accounts_db[account_id]
-    raise HTTPException(status_code=404, detail="Account not found")
+    """
+    Get prediction for a specific account by ID.
+    
+    **Day 3 Requirement:** Retrieve single account detail
+    """
+    if not predictor:
+        raise HTTPException(status_code=500, detail="AI Engine not loaded")
+    
+    # Check if account exists in memory
+    if account_id not in accounts_db:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Account {account_id} not found. Upload CSV first via /analyze"
+        )
+    
+    try:
+        account_data = accounts_db[account_id]
+        result = predictor.predict_recovery(account_data)
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.get("/accounts/list")
+def list_accounts():
+    """List all accounts in memory"""
+    return {
+        "total_accounts": len(accounts_db),
+        "account_ids": list(accounts_db.keys())
+    }
+
+# ============================================================================
+# RUN SERVER
+# ============================================================================
+
+if __name__ == "__main__": 
+    print("🚀 Starting RECOV.AI Backend Server...")
+    print("📍 Server will run at: http://127.0.0.1:8000")
+    print("📖 API Docs: http://127.0.0.1:8000/docs")
+    
+    uvicorn.run(app, host="127.0.0.1", port=8000)

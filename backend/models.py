@@ -1,42 +1,70 @@
-from pydantic import BaseModel
-from typing import List, Optional
+"""
+RECOV.AI - Pydantic Data Models
+================================
+Type-safe data structures for API requests and responses.
+"""
 
-# 1. INPUT MODEL (Matches your CSV columns)
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+# ============================================================================
+# INPUT MODELS
+# ============================================================================
+
 class AccountData(BaseModel):
+    """Input model for account data"""
     account_id: str
-    company_name: str
+    company_name: str = "Unknown"
     amount: float
     days_overdue: int
     payment_history_score: float
     shipment_volume_change_30d: float
-    # Optional fields (Good to have, but not strictly required for prediction if model doesn't use them)
-    industry: Optional[str] = None
-    region: Optional[str] = None
-    shipment_volume_30d: Optional[float] = 0.0
+    
+    # Optional fields with defaults
+    shipment_volume_30d: Optional[int] = 0
     express_ratio: Optional[float] = 0.0
     destination_diversity: Optional[int] = 0
-    contact_attempts: Optional[int] = 0
-    customer_tenure_months: Optional[int] = 0
-    email_opened: Optional[int] = 0
-    dispute_flag: Optional[int] = 0
+    industry: Optional[str] = "Other"
+    region: Optional[str] = "Other"
+    email_opened: Optional[bool] = False
+    dispute_flag: Optional[bool] = False
+    
+    class Config:
+        extra = "ignore"  # Ignore extra fields
 
-# 2. OUTPUT MODELS
-class TopFactor(BaseModel):
-    feature: str
-    impact: str  # "Increases Risk" or "Increases Recovery"
-    value: float
+# ============================================================================
+# OUTPUT MODELS
+# ============================================================================
 
 class DCARecommendation(BaseModel):
-    agency_name: str
-    strategy: str
-    estimated_commission: str
+    """DCA recommendation details"""
+    name: str
+    specialization: str
+    reasoning: str = "Recommended based on account profile"
+
+class TopFactor(BaseModel):
+    """Feature importance factor"""
+    feature: str
+    impact: float
+    direction: str
 
 class PredictionResponse(BaseModel):
+    """Complete prediction response"""
     account_id: str
-    risk_score: float
-    recovery_probability: float
-    risk_level: str  # "Low", "Medium", "High"
-    expected_recovery_amount: float
-    days_to_pay_prediction: int
+    company_name: str
+    recovery_probability: float = Field(..., ge=0.0, le=1.0, description="Probability of recovery (0-1)")
+    recovery_percentage: float = Field(..., ge=0.0, le=1.0, description="Expected recovery percentage")
+    expected_days: int = Field(..., ge=1, le=180, description="Expected days to recovery")
+    recovery_velocity_score: float = Field(..., ge=0.0, description="Recovery velocity metric")
+    risk_level: str = Field(..., description="Risk category: Low/Medium/High/Very High")
+    recommended_dca: DCARecommendation
     top_factors: List[TopFactor]
-    dca_recommendation: DCARecommendation
+    prediction_timestamp: str
+    error: Optional[str] = None
+
+class BatchAnalysisResponse(BaseModel):
+    """Batch analysis response"""
+    total_accounts: int
+    predictions: List[PredictionResponse]
+    summary: dict
